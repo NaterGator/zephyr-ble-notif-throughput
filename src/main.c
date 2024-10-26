@@ -25,7 +25,6 @@
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
 #define MTU_OVERHEAD 3
 
-
 static ssize_t write_cmd_cb(struct bt_conn *conn,
                             const struct bt_gatt_attr *attr,
                             const void *buf,
@@ -38,11 +37,11 @@ static volatile bool data_length_req;
 static volatile bool test_ready;
 static volatile bool m_notif_enabled = false;
 static volatile bool m_notif_send    = false;
+static volatile uint16_t m_mtu = 23;
 static struct bt_conn *default_conn;
 
-static uint8_t m_msg_buffer[CONFIG_BT_CTLR_DATA_LENGTH_MAX];
-static size_t  m_buffer_len = CONFIG_BT_CTLR_DATA_LENGTH_MAX;
-static uint16_t m_msg_idx_cnt = 0;
+static uint8_t  m_msg_buffer[CONFIG_BT_L2CAP_TX_MTU - MTU_OVERHEAD];
+static uint32_t m_msg_idx_cnt = 0;
 
 #define SERVICE_UUID_BYTES 0xf4, 0xec, 0x36, 0x41, 0xde, 0x4b, 0x45, 0xa7, \
                            0xf8, 0x4a, 0xbd, 0x54, 0x64, 0xe4, 0xb3, 0x1f
@@ -117,7 +116,7 @@ static int send_data(void *data, const uint16_t len, struct bt_gatt_attr *attr)
 	}
 	int err = 0;
 
-	const uint16_t mtu = bt_gatt_get_mtu(default_conn);
+	const uint16_t mtu = m_mtu;
 	if (len <= (mtu - MTU_OVERHEAD)) {
 		err = bt_gatt_notify(default_conn, attr, data, len);
 	} else {
@@ -168,7 +167,7 @@ static void connected(struct bt_conn *conn, uint8_t hci_err)
 		printk("Failed to get connection info %d\n", err);
 		return;
 	}
-
+	m_mtu = 23;
 	printk("Conn. interval is %u units\n", info.le.interval);
 
 }
@@ -248,10 +247,6 @@ static void le_data_length_updated(struct bt_conn *conn,
 	printk("LE data len updated: TX (len: %d time: %d)"
 	       " RX (len: %d time: %d)\n", info->tx_max_len,
 	       info->tx_max_time, info->rx_max_len, info->rx_max_time);
-	m_buffer_len = info->tx_max_len;
-	if (m_buffer_len > sizeof(m_msg_buffer)) {
-		m_buffer_len = sizeof(m_msg_buffer);
-	}
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
@@ -263,19 +258,36 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.le_data_len_updated = le_data_length_updated
 };
 
+void mtu_updated(struct bt_conn *conn, uint16_t tx, uint16_t rx)
+{
+	printk("Updated MTU: TX: %d RX: %d bytes\n", tx, rx);
+	m_mtu = tx;
+	if (m_mtu >= CONFIG_BT_L2CAP_TX_MTU) {
+		m_mtu = CONFIG_BT_L2CAP_TX_MTU;
+	}
+}
+
+static struct bt_gatt_cb gatt_callbacks = {
+	.att_mtu_updated = mtu_updated,
+};
+
+
 // Thread to pump data out the notification as quickly as possible
 static void notify_thread(void *, void *, void *)
 {
 	// Message pump for the notification characteristic
 	while(1) {
 		if (m_notif_enabled && m_notif_send) {
-			for (int i = 0; i < sizeof(m_msg_buffer); i++) {
-				m_msg_buffer[i] = m_msg_idx_cnt++;
+			// Ensure each notification fits nicely without fragmenting.
+			const size_t len = m_mtu - MTU_OVERHEAD;
+			for (int i = 0; i < len; i++) {
+				const uint8_t shift = (m_msg_idx_cnt & 1) ? 9 : 1;
+				m_msg_buffer[i] = (m_msg_idx_cnt++ >> shift) & 0xFF;
 			}
-			if (m_msg_idx_cnt > sizeof(m_msg_buffer)) {
-				m_msg_idx_cnt %= sizeof(m_msg_buffer);
+			if (m_msg_idx_cnt > (UINT16_MAX << 1)) {
+				m_msg_idx_cnt %= (UINT16_MAX << 1);
 			}
-			send_data(m_msg_buffer, sizeof(m_msg_buffer), &m_attrs[3]);
+			send_data(m_msg_buffer, len, &m_attrs[3]);
 		} else {
 			k_msleep(100);
 		}
@@ -293,7 +305,7 @@ int main(void)
 {
 	int err;
 
-	printk("Starting Bluetooth Throughput example\n");
+	printk("Starting Bluetooth Throughput example v1.0.1\n");
 
 	err = bt_enable(NULL);
 	if (err) {
@@ -304,6 +316,7 @@ int main(void)
 	printk("Bluetooth initialized\n");
 	
 	printk("\nStarting advertising\n");
+	bt_gatt_cb_register(&gatt_callbacks);
 	bt_gatt_service_register(&m_svcs);
 	adv_start();
 	return 0;
