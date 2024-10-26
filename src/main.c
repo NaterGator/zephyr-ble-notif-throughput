@@ -25,6 +25,22 @@
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
 #define MTU_OVERHEAD 3
 
+typedef enum {
+	SET_PREFERRED_PHY = 0,
+} workqueue_tasktype_t; 
+
+typedef struct workqueue_item {
+	workqueue_tasktype_t tasktype;
+	union
+	{
+		struct preferred_phy_opts {
+			uint8_t rx_phytype;
+			uint8_t tx_phytype;
+		} pref_phy_opts;
+	};
+} workqueue_item_t;
+K_MSGQ_DEFINE(work_msgq, sizeof(workqueue_item_t), 2, 4);
+
 static ssize_t write_cmd_cb(struct bt_conn *conn,
                             const struct bt_gatt_attr *attr,
                             const void *buf,
@@ -86,6 +102,25 @@ static const char *phy2str(uint8_t phy)
 	}
 }
 
+static void update_phy(struct bt_conn *conn,
+                       const uint8_t phyrx,
+                       const uint8_t phytx)
+{
+	int err;
+	const struct bt_conn_le_phy_param preferred_phy = {
+	    .options = BT_CONN_LE_PHY_OPT_NONE,
+	    .pref_rx_phy = phyrx,
+	    .pref_tx_phy = phytx,
+	};
+	err = bt_conn_le_phy_update(conn, &preferred_phy);
+	if (err) {
+		printk("bt_conn_le_phy_update() returned %d\n", err);
+	} else {
+		printf("Requested change to TX PHY %s, RX PHY %s PHY\n",
+		       phy2str(phytx), phy2str(phyrx));
+	}
+}
+
 ssize_t static write_cmd_cb(struct bt_conn *conn,
                             const struct bt_gatt_attr *attr,
                             const void *buf,
@@ -97,7 +132,17 @@ ssize_t static write_cmd_cb(struct bt_conn *conn,
 	if (len >= 2) {
 		if (dptr[0] == 0x01) {
 			// set notification streaming on buf[1]
-			m_notif_send = dptr[1] == 0x01;
+			const bool streaming = dptr[1] == 0x01;
+			m_notif_send = streaming;
+			workqueue_item_t wqi = {.tasktype = SET_PREFERRED_PHY};
+			if (streaming) {
+				wqi.pref_phy_opts.rx_phytype = BT_GAP_LE_PHY_2M;
+				wqi.pref_phy_opts.tx_phytype = BT_GAP_LE_PHY_2M;
+			} else {
+				wqi.pref_phy_opts.rx_phytype = BT_GAP_LE_PHY_1M;
+				wqi.pref_phy_opts.tx_phytype = BT_GAP_LE_PHY_1M;
+			}
+			k_msgq_put(&work_msgq, &wqi, K_NO_WAIT);
 		}
 	}
 	return len;
@@ -275,6 +320,7 @@ static struct bt_gatt_cb gatt_callbacks = {
 // Thread to pump data out the notification as quickly as possible
 static void notify_thread(void *, void *, void *)
 {
+	workqueue_item_t wq = {0};
 	// Message pump for the notification characteristic
 	while(1) {
 		if (m_notif_enabled && m_notif_send) {
@@ -291,6 +337,21 @@ static void notify_thread(void *, void *, void *)
 		} else {
 			k_msleep(100);
 		}
+		
+		while(k_msgq_get(&work_msgq, &wq, K_NO_WAIT) == 0) {
+			switch(wq.tasktype) {
+				case SET_PREFERRED_PHY:
+					if (default_conn) {
+						update_phy(default_conn,
+						           wq.pref_phy_opts.rx_phytype,
+						           wq.pref_phy_opts.tx_phytype);
+					}
+					break;
+				default:
+					printk("Unrecognized workqueue type: %d\n", wq.tasktype);
+					break;
+			}
+		}
 	}
 }
 
@@ -299,7 +360,6 @@ static void notify_thread(void *, void *, void *)
 K_THREAD_DEFINE(notify_thread_id, NOTIFY_THREAD_STACKSIZE, notify_thread,
                 NULL, NULL, NULL, // unused args
                 NOTIFY_THREAD_PRIORITY, 0, 0);
-
 
 int main(void)
 {
