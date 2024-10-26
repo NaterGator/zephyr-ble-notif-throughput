@@ -365,7 +365,7 @@ int main(void)
 {
 	int err;
 
-	printk("Starting Bluetooth Throughput example v1.0.1\n");
+	printk("Starting Bluetooth Throughput example v1.0.2\n");
 
 	err = bt_enable(NULL);
 	if (err) {
